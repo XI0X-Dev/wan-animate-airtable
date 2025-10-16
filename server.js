@@ -9,7 +9,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
-const WAVESPEED_API_KEY = process.env.WAVESPEED_API_KEY;
+const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE || 'animate_generation';
+const WAVESPEED_API_KEY = process.env.KLING_API_KEY;
+const WAVESPEED_BASE = process.env.WAVESPEED_BASE || 'https://api.wavespeed.ai';
+const WAVESPEED_SUBMIT_PATH = process.env.WAVESPEED_SUBMIT_PATH || 'api/v3/wavespeed-ai/wan-2.2/animate';
+const WAVESPEED_RESULT_PATH = process.env.WAVESPEED_RESULT_PATH || '/api/v3/predictions';
 
 // Initialize Airtable
 const base = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
@@ -19,7 +23,12 @@ app.get('/', (req, res) => {
     res.json({ 
         status: 'online',
         service: 'Wan 2.2 Animate Generation',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        config: {
+            table: AIRTABLE_TABLE,
+            submitUrl: `${WAVESPEED_BASE}/${WAVESPEED_SUBMIT_PATH}`,
+            resultUrl: `${WAVESPEED_BASE}${WAVESPEED_RESULT_PATH}`
+        }
     });
 });
 
@@ -34,6 +43,7 @@ app.post('/generate-animation', async (req, res) => {
     console.log('='.repeat(60));
     console.log('Starting animation generation for record:', recordId);
     console.log('Time:', new Date().toISOString());
+    console.log('Table:', AIRTABLE_TABLE);
     
     // Respond immediately to Airtable (prevent timeout)
     res.json({ 
@@ -46,19 +56,21 @@ app.post('/generate-animation', async (req, res) => {
     try {
         // Fetch record from Airtable
         console.log('Fetching record from Airtable...');
-        const record = await base('animate_generation').find(recordId);
+        const record = await base(AIRTABLE_TABLE).find(recordId);
         
         const inputImage = record.fields.input_image?.[0]?.url;
         const inputVideo = record.fields.input_video?.[0]?.url;
         const prompt = record.fields.prompt || '';
-        const mode = record.fields.mode || 'animate';
-        const resolution = record.fields.resolution || '480p';
         const seed = record.fields.seed || -1;
+
+        // Fixed values
+        const mode = 'animate';
+        const resolution = '720p';
 
         console.log('Input image:', inputImage ? 'Found' : 'Missing');
         console.log('Input video:', inputVideo ? 'Found' : 'Missing');
-        console.log('Mode:', mode);
-        console.log('Resolution:', resolution);
+        console.log('Mode:', mode, '(fixed)');
+        console.log('Resolution:', resolution, '(fixed)');
 
         // Validate required fields
         if (!inputImage) {
@@ -69,13 +81,16 @@ app.post('/generate-animation', async (req, res) => {
         }
 
         // Update status
-        await base('animate_generation').update(recordId, {
+        await base(AIRTABLE_TABLE).update(recordId, {
             status: 'Generating...',
             error_log: `Started at ${new Date().toISOString()}\nMode: ${mode}\nResolution: ${resolution}`
         });
 
         // Submit to Wavespeed API
         console.log('Submitting to Wavespeed API...');
+        const submitUrl = `${WAVESPEED_BASE}/${WAVESPEED_SUBMIT_PATH}`;
+        console.log('Submit URL:', submitUrl);
+
         const submitPayload = {
             image: inputImage,
             video: inputVideo,
@@ -89,17 +104,14 @@ app.post('/generate-animation', async (req, res) => {
             submitPayload.prompt = prompt;
         }
 
-        const submitResponse = await fetch(
-            'https://api.wavespeed.ai/api/v3/wavespeed-ai/wan-2.2/animate',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${WAVESPEED_API_KEY}`
-                },
-                body: JSON.stringify(submitPayload)
-            }
-        );
+        const submitResponse = await fetch(submitUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${WAVESPEED_API_KEY}`
+            },
+            body: JSON.stringify(submitPayload)
+        });
 
         const submitResult = await submitResponse.json();
         console.log('Submit response:', submitResult);
@@ -112,7 +124,7 @@ app.post('/generate-animation', async (req, res) => {
         console.log('Job submitted successfully! Job ID:', jobId);
 
         // Update with job ID
-        await base('animate_generation').update(recordId, {
+        await base(AIRTABLE_TABLE).update(recordId, {
             job_id: jobId,
             status: 'Processing...',
             error_log: `Job ID: ${jobId}\nSubmitted at ${new Date().toISOString()}`
@@ -132,19 +144,19 @@ app.post('/generate-animation', async (req, res) => {
             console.log(`Polling attempt ${attempt}/${maxAttempts} (${elapsed}s elapsed)...`);
 
             // Update status with time
-            await base('animate_generation').update(recordId, {
+            await base(AIRTABLE_TABLE).update(recordId, {
                 status: `Generating... ${elapsed}s elapsed`,
                 error_log: `Job ID: ${jobId}\nProcessing... (attempt ${attempt}/${maxAttempts})`
             });
 
-            const resultResponse = await fetch(
-                `https://api.wavespeed.ai/api/v3/predictions/${jobId}/result`,
-                {
-                    headers: {
-                        'Authorization': `Bearer ${WAVESPEED_API_KEY}`
-                    }
+            const resultUrl = `${WAVESPEED_BASE}${WAVESPEED_RESULT_PATH}/${jobId}/result`;
+            console.log('Checking result at:', resultUrl);
+
+            const resultResponse = await fetch(resultUrl, {
+                headers: {
+                    'Authorization': `Bearer ${WAVESPEED_API_KEY}`
                 }
-            );
+            });
 
             const result = await resultResponse.json();
             console.log('Current status:', result.data?.status);
@@ -159,22 +171,15 @@ app.post('/generate-animation', async (req, res) => {
 
                 console.log('Animation completed! Video URL:', videoUrl);
 
-                // Download video
-                console.log('Downloading video...');
-                const videoResponse = await fetch(videoUrl);
-                const videoBuffer = await videoResponse.arrayBuffer();
-                const base64Video = Buffer.from(videoBuffer).toString('base64');
-
-                console.log('Uploading to Airtable...');
-                await base('animate_generation').update(recordId, {
-                    output_video: [{
-                        url: videoUrl
-                    }],
+                // Store video URL directly (no download needed)
+                console.log('Updating Airtable with video URL...');
+                await base(AIRTABLE_TABLE).update(recordId, {
+                    output_video: videoUrl,
                     status: 'Completed',
-                    error_log: `Completed at ${new Date().toISOString()}\nTotal time: ${elapsed}s\nVideo: ${videoUrl}`
+                    error_log: `Completed at ${new Date().toISOString()}\nTotal time: ${elapsed}s\nVideo URL: ${videoUrl}`
                 });
 
-                console.log('SUCCESS! Animation uploaded to Airtable');
+                console.log('SUCCESS! Video URL saved to Airtable');
                 console.log('='.repeat(60));
 
             } else if (result.data?.status === 'failed') {
@@ -192,7 +197,7 @@ app.post('/generate-animation', async (req, res) => {
         
         // Update Airtable with error
         try {
-            await base('animate_generation').update(recordId, {
+            await base(AIRTABLE_TABLE).update(recordId, {
                 status: 'Failed',
                 error_log: `Error: ${error.message}\nTime: ${new Date().toISOString()}`
             });
@@ -208,4 +213,10 @@ app.listen(PORT, () => {
     console.log('Endpoints:');
     console.log('  GET  / - Health check');
     console.log('  POST /generate-animation - Generate animation');
+    console.log('Settings:');
+    console.log('  Mode: animate (fixed)');
+    console.log('  Resolution: 720p (fixed)');
+    console.log('  Table:', AIRTABLE_TABLE);
+    console.log('  Submit URL:', `${WAVESPEED_BASE}/${WAVESPEED_SUBMIT_PATH}`);
+    console.log('  Result URL:', `${WAVESPEED_BASE}${WAVESPEED_RESULT_PATH}`);
 });
